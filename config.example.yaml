@@ -1,0 +1,31 @@
+# AI Novel-to-Screenplay Converter Configuration
+# Copy this file to config.yaml and fill in your own values.
+
+llm:
+  # Provider: anthropic | deepseek
+  provider: deepseek
+  model: deepseek-chat
+  max_tokens: 8192
+  temperature: 0.3
+  # API key — replace with your actual key
+  api_key: YOUR_API_KEY_HERE
+  # DeepSeek base URL (ignored for anthropic provider)
+  base_url: https://api.deepseek.com
+
+conversion:
+  # Maximum characters per chunk sent to LLM in one request
+  max_chunk_size: 8000
+  # Chapter detection patterns (regex)
+  chapter_patterns:
+    - "^第[零一二三四五六七八九十百千0-9]+章"
+    - "^Chapter\\s+\\d+"
+    - "^#+\\s*第[零一二三四五六七八九十百千0-9]+章"
+    - "^#+\\s*Chapter\\s+\\d+"
+  # Minimum number of chapters required
+  min_chapters: 3
+
+output:
+  # YAML output style
+  default_yaml_width: 120
+  allow_unicode: true
+  sort_keys: false

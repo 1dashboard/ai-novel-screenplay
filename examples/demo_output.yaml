@@ -1,0 +1,61 @@
+screenplay:
+  meta:
+    title: 春日尽
+    original_work: 春日尽
+    original_author: null
+    adapted_by: AI Novel-to-Script v0.1.0
+    version: 0.1.0
+    created_at: '2026-06-05T07:08:20.148850Z'
+    language: zh-CN
+    total_acts: 1
+    total_scenes: 3
+    source_file: D:\Project\ai_novel_script_project\examples\sample_novel.txt
+    notes:
+    - （LLM 未启用，此为结构模板，需人工填充内容）
+    - （LLM 未启用，此为结构模板，需人工填充内容）
+    - （LLM 未启用，此为结构模板，需人工填充内容）
+  characters:
+  - id: char_001
+    name: （待提取）
+    aliases: []
+    role: minor
+    gender: unknown
+    age_range: null
+    traits: []
+    description: LLM 未启用，角色待人工标注
+    relationships: []
+    first_appearance_scene: null
+  acts:
+  - act_number: 1
+    title: ''
+    scenes:
+    - scene_number: 1
+      scene_heading: 第1章：琴声
+      location: （待定）
+      time_of_day: 日
+      characters_present: []
+      summary: 章节概要：琴声
+      content:
+      - type: note
+        text: （LLM 未启用，此为结构模板，需人工填充内容）
+        severity: info
+    - scene_number: 2
+      scene_heading: 第2章：故人
+      location: （待定）
+      time_of_day: 日
+      characters_present: []
+      summary: 章节概要：故人
+      content:
+      - type: note
+        text: （LLM 未启用，此为结构模板，需人工填充内容）
+        severity: info
+    - scene_number: 3
+      scene_heading: 第3章：火花
+      location: （待定）
+      time_of_day: 日
+      characters_present: []
+      summary: 章节概要：火花
+      content:
+      - type: note
+        text: （LLM 未启用，此为结构模板，需人工填充内容）
+        severity: info

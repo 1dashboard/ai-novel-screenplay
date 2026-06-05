@@ -1,0 +1,47 @@
+# Secrets
+config.yaml
+
+# Database
+data/
+
+# Uploads
+uploads/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Node / Frontend
+node_modules/
+frontend/dist/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test data / scratch
+ceshi/
+novel.txt
+stream_test.txt
+doupo_screenplay.yaml
+*.eval.txt
+*.log
+.codegraph/daemon.pid
+
+# Env
+.env
+.env.local
+.env.*.local
