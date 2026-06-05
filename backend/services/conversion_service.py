@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,9 +16,23 @@ from ..config import settings
 from ..database import SessionLocal
 from ..models.task import ConversionTask
 from ..models.screenplay import ScreenplayRecord
+from . import cos_service as cos
 from .stream import push as stream_push
 
 logger = logging.getLogger(__name__)
+
+
+class TaskDeletedError(Exception):
+    """Raised when a task is deleted during conversion — stops processing."""
+
+
+def _cleanup_temp_file(file_path: str) -> None:
+    """Safely remove a temporary file, ignoring errors."""
+    try:
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -86,11 +101,12 @@ def _sync_run_conversion(task_id: int, file_path: str, output_path: str, config_
             task_db: Session = SessionLocal()
             try:
                 t = task_db.query(ConversionTask).filter(ConversionTask.id == task_id).first()
-                if t:
-                    t.status = "processing"
-                    t.progress = percent
-                    t.progress_message = message
-                    task_db.commit()
+                if t is None:
+                    raise TaskDeletedError("Task was deleted during conversion")
+                t.status = "processing"
+                t.progress = percent
+                t.progress_message = message
+                task_db.commit()
             finally:
                 task_db.close()
             stream_push(task_id, "progress", progress=percent, message=message)
@@ -134,6 +150,11 @@ def _sync_run_conversion(task_id: int, file_path: str, output_path: str, config_
         score = None
         if eval_path.exists():
             eval_summary = eval_path.read_text(encoding="utf-8")
+            # Replace temp file path with original filename in the report
+            eval_summary = eval_summary.replace(
+                str(Path(output_path).resolve()),
+                task.original_filename,
+            )
             for line in eval_summary.splitlines():
                 if "综合评分" in line:
                     try:
@@ -166,6 +187,15 @@ def _sync_run_conversion(task_id: int, file_path: str, output_path: str, config_
         task.completed_at = datetime.now(timezone.utc)
         db.commit()
 
+        # --- Upload YAML result to COS ---
+        yaml_key = cos.generate_result_key(task.user_id, task_id, ".yaml")
+        try:
+            cos.upload_object(yaml_key, yaml_content.encode("utf-8"), "application/x-yaml")
+            task.yaml_file_key = yaml_key
+            db.commit()
+        except Exception as e:
+            logger.warning("Failed to upload YAML to COS: %s", e)
+
         stream_push(task_id, "log", text="\n[完成] 剧本转换完毕！\n")
         stream_push(task_id, "yaml_chunk", text=yaml_content)
         stream_push(task_id, "complete",
@@ -177,6 +207,16 @@ def _sync_run_conversion(task_id: int, file_path: str, output_path: str, config_
             scene_count=screenplay.meta.total_scenes,
         )
 
+        # Clean up temp files
+        _cleanup_temp_file(file_path)
+        _cleanup_temp_file(output_path)
+        if eval_path.exists():
+            _cleanup_temp_file(str(eval_path))
+
+    except TaskDeletedError:
+        logger.info("Conversion task %d was deleted during processing — aborting", task_id)
+        _cleanup_temp_file(file_path)
+        _cleanup_temp_file(output_path)
     except Exception as e:
         logger.exception("Conversion task %d failed", task_id)
         err_msg = traceback.format_exc()

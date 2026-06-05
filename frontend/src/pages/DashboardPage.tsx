@@ -40,13 +40,22 @@ export default function DashboardPage() {
 
   useEffect(() => { fetchTasks(); }, [fetchTasks]);
 
-  // Poll for in-progress tasks
+  // Poll for updates — fast when processing tasks exist, slow otherwise
   useEffect(() => {
     const hasProcessing = tasks.some(t => t.status === 'pending' || t.status === 'processing');
-    if (!hasProcessing) return;
-    const timer = setInterval(fetchTasks, 3000);
+    const interval = hasProcessing ? 3000 : 5000;
+    const timer = setInterval(fetchTasks, interval);
     return () => clearInterval(timer);
   }, [tasks, fetchTasks]);
+
+  // Refetch when tab becomes visible (covers cross-tab scenarios)
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') fetchTasks();
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => document.removeEventListener('visibilitychange', onVisible);
+  }, [fetchTasks]);
 
   const handleDelete = async (id: number) => {
     if (!confirm('确定删除此任务？')) return;

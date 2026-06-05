@@ -1,13 +1,14 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams, Link } from 'react-router-dom';
-import { getTask, getScreenplay, getEvaluation, downloadYaml } from '../api/conversion';
+import { getTask, getScreenplay, getEvaluation, downloadYaml, updateScreenplay, getYamlContent } from '../api/conversion';
 import type { TaskResponse, ScreenplayData, EvaluationData } from '../types';
 import StatusBadge from '../components/common/StatusBadge';
 import ProgressBar from '../components/common/ProgressBar';
-import ScreenplayPreview from '../components/conversion/ScreenplayPreview';
+import SplitScreenplayPreview from '../components/conversion/SplitScreenplayPreview';
 import EvaluationReport from '../components/conversion/EvaluationReport';
 import YamlViewer from '../components/conversion/YamlViewer';
 import CharacterGraph from '../components/conversion/CharacterGraph';
+import ChatSidebar from '../components/conversion/ChatSidebar';
 import ExportMenu from '../components/conversion/ExportMenu';
 import { DetailSkeleton } from '../components/common/Skeleton';
 import { useToast } from '../contexts/ToastContext';
@@ -39,6 +40,9 @@ export default function ConversionDetailPage() {
   const [liveMessage, setLiveMessage] = useState('');
   const [streamActive, setStreamActive] = useState(false);
   const [resultsReady, setResultsReady] = useState(false);
+  const [highlightCharacter, setHighlightCharacter] = useState<string | undefined>(undefined);
+  const [showChat, setShowChat] = useState(false);
+  const [chatYaml, setChatYaml] = useState('');
   const logEndRef = useRef<HTMLDivElement>(null);
   const counterRef = useRef(0);
   const abortRef = useRef(false);
@@ -63,6 +67,48 @@ export default function ConversionDetailPage() {
       toastError('加载剧本数据失败');
     }
   }, [toastError]);
+
+  const handleScreenplaySave = useCallback(async (yaml: string, _stats: { character_count: number; act_count: number; scene_count: number }) => {
+    await updateScreenplay(parseInt(taskId!), yaml);
+    // Re-fetch screenplay so all exports reflect edits
+    const sp = await getScreenplay(parseInt(taskId!));
+    setScreenplay(sp);
+  }, [taskId]);
+
+  const handleCharacterClick = useCallback((characterName: string) => {
+    setHighlightCharacter(characterName);
+    setActiveTab('screenplay');
+  }, []);
+
+  const handleClearHighlight = useCallback(() => {
+    setHighlightCharacter(undefined);
+  }, []);
+
+  const handleOpenChat = useCallback(async () => {
+    if (!taskId) return;
+    setShowChat(true);
+    // Fetch the current YAML for the chat context
+    if (!chatYaml) {
+      try {
+        const yamlText = await getYamlContent(parseInt(taskId));
+        setChatYaml(yamlText);
+      } catch {
+        // If fetch fails, generate from current screenplay data
+        if (screenplay) {
+          const { screenplayToYaml } = await import('../utils/screenplayToYaml');
+          setChatYaml(screenplayToYaml(screenplay));
+        }
+      }
+    }
+  }, [taskId, chatYaml, screenplay]);
+
+  const handleApplyChatChanges = useCallback(async (yaml: string) => {
+    await updateScreenplay(parseInt(taskId!), yaml);
+    setChatYaml(yaml);
+    // Re-fetch screenplay so all views update
+    const sp = await getScreenplay(parseInt(taskId!));
+    setScreenplay(sp);
+  }, [taskId]);
 
   function handleSSEComplete(data: { screenplay_id?: number; score?: number; chapter_count?: number; character_count?: number; scene_count?: number }) {
     console.log('[SSE] handleSSEComplete called');
@@ -250,8 +296,13 @@ export default function ConversionDetailPage() {
   }
   if (error || !task) return <div className="text-red-600 py-12 text-center">{error || '任务不存在'}</div>;
 
-  // Show terminal for processing/pending, or when waiting for results
-  const showTerminal = streamActive || task.status === 'pending' || task.status === 'processing' || (task.status === 'completed' && !resultsReady);
+  // Only show terminal for tasks that are actually in progress
+  const showTerminal = streamActive || task.status === 'pending' || task.status === 'processing';
+
+  // For completed tasks, wait for results silently (no terminal flash)
+  if (task.status === 'completed' && !resultsReady) {
+    return <div className="max-w-4xl mx-auto"><DetailSkeleton /></div>;
+  }
 
   // ======================== PROCESSING / STREAMING VIEW ========================
   if (showTerminal) {
@@ -319,6 +370,23 @@ export default function ConversionDetailPage() {
         <div className="flex items-center justify-between mb-4">
           <h1 className="text-xl font-bold">{task.original_filename}</h1>
           <div className="flex items-center gap-3">
+            <button
+              onClick={() => {
+                if (showChat) {
+                  setShowChat(false);
+                } else {
+                  handleOpenChat();
+                }
+              }}
+              className={`text-sm px-4 py-2 rounded-lg transition-all font-medium flex items-center gap-1.5 ${
+                showChat
+                  ? 'bg-purple-600 text-white'
+                  : 'bg-purple-50 dark:bg-purple-900/20 text-purple-600 dark:text-purple-400 border border-purple-200 dark:border-purple-800 hover:bg-purple-100 dark:hover:bg-purple-900/40'
+              }`}
+            >
+              <span>{showChat ? '🤖' : '💬'}</span>
+              AI 助理
+            </button>
             <ExportMenu
               taskId={task.id}
               title={task.original_filename}
@@ -329,10 +397,12 @@ export default function ConversionDetailPage() {
             <StatusBadge status={task.status} />
           </div>
         </div>
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm text-gray-600 dark:text-gray-400 mb-4">
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-4 text-sm text-gray-600 dark:text-gray-400 mb-4">
           <div>创建: {new Date(task.created_at).toLocaleString('zh-CN')}</div>
           {task.completed_at && <div>完成: {new Date(task.completed_at).toLocaleString('zh-CN')}</div>}
           {task.chapter_count != null && <div>章节: {task.chapter_count}</div>}
+          {screenplay && <div>角色: {screenplay.characters.length}</div>}
+          {screenplay && <div>场景: {screenplay.meta.total_scenes}</div>}
           {task.score != null && <div>评分: <span className="font-bold text-green-600">{task.score}/100</span></div>}
         </div>
         {task.status === 'failed' && (
@@ -344,28 +414,38 @@ export default function ConversionDetailPage() {
       </div>
 
       {task.status === 'completed' && screenplay && (
-        <div>
-          <div className="flex gap-1 border-b border-gray-200 dark:border-gray-800 mb-6">
-            {([
-              ['screenplay', '剧本预览'],
-              ['graph', '角色关系'],
-              ['evaluation', '评估报告'],
-              ['yaml', '原始 YAML'],
-            ] as [Tab, string][]).map(([key, label]) => (
-              <button key={key} onClick={() => setActiveTab(key)}
-                className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors
-                  ${activeTab === key
-                    ? 'border-blue-600 text-blue-600'
-                    : 'border-transparent text-gray-500 hover:text-gray-700 dark:hover:text-gray-300'
-                  }`}>
-                {label}
-              </button>
-            ))}
+        <div className="flex gap-4">
+          <div className="flex-1 min-w-0">
+            <div className="flex gap-1 border-b border-gray-200 dark:border-gray-800 mb-6">
+              {([
+                ['screenplay', '剧本预览'],
+                ['graph', '角色关系'],
+                ['evaluation', '评估报告'],
+                ['yaml', '原始 YAML'],
+              ] as [Tab, string][]).map(([key, label]) => (
+                <button key={key} onClick={() => setActiveTab(key)}
+                  className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors
+                    ${activeTab === key
+                      ? 'border-blue-600 text-blue-600'
+                      : 'border-transparent text-gray-500 hover:text-gray-700 dark:hover:text-gray-300'
+                    }`}>
+                  {label}
+                </button>
+              ))}
+            </div>
+            {activeTab === 'screenplay' && <SplitScreenplayPreview data={screenplay} onSave={handleScreenplaySave} highlightCharacter={highlightCharacter} onClearHighlight={handleClearHighlight} />}
+            {activeTab === 'graph' && <CharacterGraph characters={screenplay.characters} onCharacterClick={handleCharacterClick} />}
+            {activeTab === 'evaluation' && <EvaluationReport data={evaluation} />}
+            {activeTab === 'yaml' && <YamlViewer taskId={task.id} />}
           </div>
-          {activeTab === 'screenplay' && <ScreenplayPreview data={screenplay} />}
-          {activeTab === 'graph' && <CharacterGraph characters={screenplay.characters} />}
-          {activeTab === 'evaluation' && <EvaluationReport data={evaluation} />}
-          {activeTab === 'yaml' && <YamlViewer taskId={task.id} />}
+          {showChat && (
+            <ChatSidebar
+              taskId={task.id}
+              currentYaml={chatYaml}
+              onApplyChanges={handleApplyChatChanges}
+              onClose={() => setShowChat(false)}
+            />
+          )}
         </div>
       )}
     </div>

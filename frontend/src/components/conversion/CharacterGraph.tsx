@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useRef, useCallback } from 'react';
 import type { CharacterData } from '../../types';
 
 interface Relationship {
@@ -15,7 +15,6 @@ function buildRelationships(characters: CharacterData[]): Relationship[] {
   for (const c of characters) {
     for (const r of c.relationships) {
       const targetName = r.character_id;
-      // Only include if both characters exist in the list
       if (nameSet.has(targetName) || characters.some((ch) => ch.id === r.character_id)) {
         const target = characters.find((ch) => ch.id === r.character_id || ch.name === r.character_id);
         rels.push({
@@ -43,9 +42,17 @@ function circularLayout(n: number, radius: number, cx: number, cy: number) {
   return positions;
 }
 
-export default function CharacterGraph({ characters }: { characters: CharacterData[] }) {
+export default function CharacterGraph({
+  characters,
+  onCharacterClick,
+}: {
+  characters: CharacterData[];
+  onCharacterClick?: (characterName: string) => void;
+}) {
   const [hovered, setHovered] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
+  const [exporting, setExporting] = useState(false);
+  const svgRef = useRef<SVGSVGElement>(null);
 
   const relationships = useMemo(() => buildRelationships(characters), [characters]);
 
@@ -79,7 +86,6 @@ export default function CharacterGraph({ characters }: { characters: CharacterDa
     }
   };
 
-  // Filter relationships for highlighting
   const relatedChars = useMemo(() => {
     if (!hovered && !selected) return new Set<string>();
     const focus = selected || hovered;
@@ -105,6 +111,83 @@ export default function CharacterGraph({ characters }: { characters: CharacterDa
     return 20;
   };
 
+  const handleNodeClick = (name: string) => {
+    setSelected(prev => prev === name ? null : name);
+    onCharacterClick?.(name);
+  };
+
+  // -------------------------------------------------------------------------
+  // Export
+  // -------------------------------------------------------------------------
+
+  const getSvgMarkup = useCallback((): string => {
+    const svg = svgRef.current;
+    if (!svg) return '';
+    const clone = svg.cloneNode(true) as SVGSVGElement;
+    // Add white background
+    const bg = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+    bg.setAttribute('width', '100%');
+    bg.setAttribute('height', '100%');
+    bg.setAttribute('fill', 'white');
+    clone.insertBefore(bg, clone.firstChild);
+    clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+    return new XMLSerializer().serializeToString(clone);
+  }, []);
+
+  const exportSvg = useCallback(() => {
+    const markup = getSvgMarkup();
+    if (!markup) return;
+    const blob = new Blob([markup], { type: 'image/svg+xml;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = '角色关系图.svg';
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [getSvgMarkup]);
+
+  const exportPng = useCallback(async () => {
+    const markup = getSvgMarkup();
+    if (!markup) return;
+    setExporting(true);
+    try {
+      const blob = new Blob([markup], { type: 'image/svg+xml;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const img = new Image();
+      await new Promise<void>((resolve, reject) => {
+        img.onload = () => resolve();
+        img.onerror = () => reject(new Error('SVG 加载失败'));
+        img.src = url;
+      });
+      const canvas = document.createElement('canvas');
+      canvas.width = width * 2;
+      canvas.height = height * 2;
+      const ctx = canvas.getContext('2d')!;
+      ctx.scale(2, 2);
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, width, height);
+      ctx.drawImage(img, 0, 0, width, height);
+      canvas.toBlob((pngBlob) => {
+        if (!pngBlob) return;
+        const pngUrl = URL.createObjectURL(pngBlob);
+        const a = document.createElement('a');
+        a.href = pngUrl;
+        a.download = '角色关系图.png';
+        a.click();
+        URL.revokeObjectURL(pngUrl);
+      }, 'image/png');
+      URL.revokeObjectURL(url);
+    } catch {
+      // Silently fail export
+    } finally {
+      setExporting(false);
+    }
+  }, [getSvgMarkup, width, height]);
+
+  // -------------------------------------------------------------------------
+  // Render
+  // -------------------------------------------------------------------------
+
   return (
     <div className="bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-800 p-4 shadow-sm">
       <div className="flex items-center justify-between mb-4">
@@ -114,24 +197,55 @@ export default function CharacterGraph({ characters }: { characters: CharacterDa
           </svg>
           角色关系图
         </h3>
-        <div className="flex items-center gap-3 text-xs text-gray-400">
-          <span className="flex items-center gap-1">
-            <span className="w-2.5 h-2.5 rounded-full bg-amber-400" /> 主角
-          </span>
-          <span className="flex items-center gap-1">
-            <span className="w-2.5 h-2.5 rounded-full bg-red-400" /> 反派
-          </span>
-          <span className="flex items-center gap-1">
-            <span className="w-2.5 h-2.5 rounded-full bg-blue-400" /> 配角
-          </span>
-          <span className="flex items-center gap-1">
-            <span className="w-2.5 h-2.5 rounded-full bg-gray-300" /> 其他
-          </span>
+        <div className="flex items-center gap-2">
+          {/* Export buttons */}
+          <button
+            onClick={exportSvg}
+            className="text-xs px-2.5 py-1.5 rounded-lg border border-gray-200 dark:border-gray-700 text-gray-500 hover:text-purple-600 hover:border-purple-300 dark:hover:border-purple-700 transition-colors flex items-center gap-1"
+            title="导出 SVG"
+          >
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+            </svg>
+            SVG
+          </button>
+          <button
+            onClick={exportPng}
+            disabled={exporting}
+            className="text-xs px-2.5 py-1.5 rounded-lg border border-gray-200 dark:border-gray-700 text-gray-500 hover:text-purple-600 hover:border-purple-300 dark:hover:border-purple-700 transition-colors flex items-center gap-1 disabled:opacity-50"
+            title="导出 PNG"
+          >
+            {exporting ? (
+              <span className="animate-spin w-3 h-3 border-2 border-purple-400 border-t-transparent rounded-full" />
+            ) : (
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+              </svg>
+            )}
+            PNG
+          </button>
+
+          {/* Legend */}
+          <div className="flex items-center gap-2 ml-2 pl-2 border-l border-gray-200 dark:border-gray-700 text-xs text-gray-400">
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded-full bg-amber-400" /> 主角
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded-full bg-red-400" /> 反派
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded-full bg-blue-400" /> 配角
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded-full bg-gray-300" /> 其他
+            </span>
+          </div>
         </div>
       </div>
 
       <div className="overflow-auto">
         <svg
+          ref={svgRef}
           viewBox={`0 0 ${width} ${height}`}
           className="w-full max-h-[480px]"
           style={{ minWidth: '500px' }}
@@ -193,7 +307,7 @@ export default function CharacterGraph({ characters }: { characters: CharacterDa
                 transform={`translate(${pos.x}, ${pos.y})`}
                 onMouseEnter={() => setHovered(char.name)}
                 onMouseLeave={() => setHovered(null)}
-                onClick={() => setSelected(selected === char.name ? null : char.name)}
+                onClick={() => handleNodeClick(char.name)}
                 className={`cursor-pointer transition-opacity ${dimmed ? 'opacity-20' : 'opacity-100'}`}
               >
                 <circle
@@ -218,7 +332,7 @@ export default function CharacterGraph({ characters }: { characters: CharacterDa
         </svg>
       </div>
 
-      {/* Legend / selected info */}
+      {/* Selected character detail */}
       {selected && (() => {
         const char = characters.find((c) => c.name === selected);
         if (!char) return null;
@@ -234,6 +348,14 @@ export default function CharacterGraph({ characters }: { characters: CharacterDa
               }`}>
                 {char.role === 'protagonist' ? '主角' : char.role === 'antagonist' ? '反派' : char.role === 'supporting' ? '配角' : '次要'}
               </span>
+              {char.first_appearance_scene && (
+                <button
+                  onClick={() => onCharacterClick?.(selected)}
+                  className="ml-auto text-xs text-purple-600 hover:text-purple-800 dark:text-purple-400 dark:hover:text-purple-200 underline underline-offset-2 transition-colors"
+                >
+                  跳转到首次出场 (场景{char.first_appearance_scene})
+                </button>
+              )}
             </div>
             {charRels.length > 0 ? (
               <div className="space-y-2">

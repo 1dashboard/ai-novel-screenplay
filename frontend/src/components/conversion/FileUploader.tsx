@@ -1,92 +1,181 @@
-import { useState, useRef, type DragEvent } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useState, useRef, useReducer, type DragEvent } from 'react';
+import { deleteTask } from '../../api/conversion';
+import { TEMPLATES, getTemplatesByCategory, type ScriptTemplate } from '../../utils/templates';
 
 const VALID_EXTS = ['.txt', '.md', '.markdown', '.docx', '.doc', '.pdf'];
 const MAX_SIZE = 50 * 1024 * 1024; // 50MB
 
+const TEMPLATE_CATEGORIES = getTemplatesByCategory();
+
+// ---------------------------------------------------------------------------
+// Upload state machine
+// ---------------------------------------------------------------------------
+
+interface UploadState {
+  uploading: boolean;
+  progress: number;
+  phase: 'cos' | 'server';
+  error: string;
+}
+
+type UploadAction =
+  | { type: 'START' }
+  | { type: 'PROGRESS'; progress: number }
+  | { type: 'PHASE_SERVER' }
+  | { type: 'ERROR'; error: string }
+  | { type: 'RESET' };
+
+const initialUpload: UploadState = {
+  uploading: false,
+  progress: 0,
+  phase: 'cos',
+  error: '',
+};
+
+function uploadReducer(state: UploadState, action: UploadAction): UploadState {
+  switch (action.type) {
+    case 'START':
+      return { uploading: true, progress: 0, phase: 'cos', error: '' };
+    case 'PROGRESS':
+      return { ...state, progress: action.progress };
+    case 'PHASE_SERVER':
+      return { ...state, phase: 'server', progress: 100 };
+    case 'ERROR':
+      return { uploading: false, progress: 0, phase: 'cos', error: action.error };
+    case 'RESET':
+      return initialUpload;
+  }
+}
+
+// ---------------------------------------------------------------------------
+
 export default function FileUploader({ onUploaded }: { onUploaded?: () => void }) {
   const [dragging, setDragging] = useState(false);
-  const [uploading, setUploading] = useState(false);
-  const [uploadProgress, setUploadProgress] = useState(0);
-  const [error, setError] = useState('');
+  const [upload, dispatch] = useReducer(uploadReducer, initialUpload);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [customPrompt, setCustomPrompt] = useState('');
+  const [selectedTemplate, setSelectedTemplate] = useState<ScriptTemplate | null>(null);
+  const [showTemplates, setShowTemplates] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const xhrRef = useRef<XMLHttpRequest | null>(null);
-  const navigate = useNavigate();
+  const cancelRequestedRef = useRef(false);
+  const currentPhaseRef = useRef<'cos' | 'server'>('cos');
 
   const handleFile = async (file: File) => {
     const ext = '.' + file.name.split('.').pop()?.toLowerCase();
     if (!VALID_EXTS.includes(ext)) {
-      setError(`不支持的文件格式 "${ext}"。支持: ${VALID_EXTS.join(', ')}`);
+      dispatch({ type: 'ERROR', error: `不支持的文件格式 "${ext}"。支持: ${VALID_EXTS.join(', ')}` });
       return;
     }
     if (file.size > MAX_SIZE) {
-      setError('文件大小超过 50MB 限制');
+      dispatch({ type: 'ERROR', error: '文件大小超过 50MB 限制' });
       return;
     }
-    setError('');
-    setUploading(true);
-    setUploadProgress(0);
-
-    const form = new FormData();
-    form.append('file', file);
-    if (customPrompt.trim()) {
-      form.append('prompt', customPrompt.trim());
-    }
+    dispatch({ type: 'START' });
 
     const token = localStorage.getItem('access_token') || '';
     const baseUrl = import.meta.env.DEV ? 'http://localhost:8003' : '';
 
-    const xhr = new XMLHttpRequest();
-    xhrRef.current = xhr;
+    try {
+      // Phase 1: Get presigned upload URL from backend
+      const presignRes = await fetch(`${baseUrl}/api/v1/conversion/presign`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ filename: file.name }),
+      });
 
-    xhr.open('POST', `${baseUrl}/api/v1/conversion/upload`);
-    xhr.setRequestHeader('Authorization', `Bearer ${token}`);
-
-    const sizeMB = (file.size / (1024 * 1024)).toFixed(1);
-
-    xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable) {
-        setUploadProgress(Math.round((e.loaded / e.total) * 100));
+      if (!presignRes.ok) {
+        const err = await presignRes.json().catch(() => ({}));
+        throw new Error((err as { detail?: string }).detail || '获取上传凭证失败');
       }
-    };
 
-    xhr.onload = () => {
-      setUploading(false);
-      setUploadProgress(100);
-      if (xhr.status >= 200 && xhr.status < 300) {
-        try {
-          const res = JSON.parse(xhr.responseText);
-          navigate(`/tasks/${res.task_id}`);
-          onUploaded?.();
-        } catch {
-          setError('服务器响应异常');
+      const { upload_url, key } = await presignRes.json() as { upload_url: string; key: string };
+
+      // Phase 2: Upload directly to COS
+      currentPhaseRef.current = 'cos';
+      cancelRequestedRef.current = false;
+      const xhr = new XMLHttpRequest();
+      xhrRef.current = xhr;
+      xhr.open('PUT', upload_url);
+
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) {
+          dispatch({ type: 'PROGRESS', progress: Math.round((e.loaded / e.total) * 100) });
         }
-      } else {
-        try {
-          const err = JSON.parse(xhr.responseText);
-          setError(err.detail || '上传失败');
-        } catch {
-          setError(`上传失败 (HTTP ${xhr.status})`);
-        }
+      };
+
+      await new Promise<void>((resolve, reject) => {
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            resolve();
+          } else {
+            reject(new Error(`COS 上传失败 (HTTP ${xhr.status})`));
+          }
+        };
+        xhr.onerror = () => reject(new Error('COS 网络连接失败'));
+        xhr.send(file);
+      });
+
+      if (cancelRequestedRef.current) return;
+
+      // Phase 3: Register with backend
+      currentPhaseRef.current = 'server';
+      dispatch({ type: 'PHASE_SERVER' });
+
+      const form = new FormData();
+      form.append('key', key);
+      form.append('filename', file.name);
+      form.append('size', String(file.size));
+      const combinedPrompt = [selectedTemplate?.prompt, customPrompt.trim()]
+        .filter(Boolean)
+        .join('\n\n---\n\n');
+      if (combinedPrompt) {
+        form.append('prompt', combinedPrompt);
       }
-    };
 
-    xhr.onerror = () => {
-      setUploading(false);
-      setError('网络连接失败，请检查网络后重试');
-    };
+      const res = await fetch(`${baseUrl}/api/v1/conversion/upload`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}` },
+        body: form,
+      });
 
-    xhr.send(form);
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error((err as { detail?: string }).detail || '创建任务失败');
+      }
+
+      const data = await res.json() as { task_id: number; status: string };
+
+      if (cancelRequestedRef.current) {
+        try { await deleteTask(data.task_id); } catch { /* ignore */ }
+        dispatch({ type: 'RESET' });
+        return;
+      }
+
+      // Use setTimeout to escape the microtask — React 19 defers
+      // microtask-based state updates, so the re-render never fires
+      setTimeout(() => {
+        dispatch({ type: 'RESET' });
+        setSelectedTemplate(null);
+        setCustomPrompt('');
+        setShowAdvanced(false);
+        setShowTemplates(false);
+        if (inputRef.current) inputRef.current.value = '';
+        onUploaded?.();
+      }, 0);
+    } catch (err: unknown) {
+      if (cancelRequestedRef.current) return;
+      dispatch({ type: 'ERROR', error: (err as Error).message || '上传失败' });
+    }
   };
 
   const cancelUpload = () => {
-    if (xhrRef.current) {
-      xhrRef.current.abort();
-      setUploading(false);
-      setUploadProgress(0);
-    }
+    cancelRequestedRef.current = true;
+    xhrRef.current?.abort();
+    dispatch({ type: 'RESET' });
   };
 
   const onDrop = (e: DragEvent) => {
@@ -105,9 +194,9 @@ export default function FileUploader({ onUploaded }: { onUploaded?: () => void }
         }}
         onDragLeave={() => setDragging(false)}
         onDrop={onDrop}
-        onClick={() => !uploading && inputRef.current?.click()}
+        onClick={() => !upload.uploading && inputRef.current?.click()}
         className={`relative border-2 border-dashed rounded-2xl p-10 text-center cursor-pointer transition-all select-none
-          ${uploading
+          ${upload.uploading
             ? 'border-blue-400 bg-blue-50/50 dark:bg-blue-900/10 pointer-events-none'
             : dragging
               ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20 scale-[1.01] shadow-lg shadow-blue-500/10'
@@ -125,17 +214,19 @@ export default function FileUploader({ onUploaded }: { onUploaded?: () => void }
           }}
         />
 
-        {uploading ? (
+        {upload.uploading ? (
           <div className="flex flex-col items-center gap-4 w-full max-w-sm mx-auto">
             <div className="w-full">
               <div className="flex justify-between text-sm mb-1.5">
-                <span className="text-gray-600 dark:text-gray-400 font-medium">上传中...</span>
-                <span className="text-blue-600 dark:text-blue-400 font-bold">{uploadProgress}%</span>
+                <span className="text-gray-600 dark:text-gray-400 font-medium">
+                  {upload.phase === 'cos' ? '上传到云存储...' : '创建任务...'}
+                </span>
+                <span className="text-blue-600 dark:text-blue-400 font-bold">{upload.progress}%</span>
               </div>
               <div className="h-2.5 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
                 <div
                   className="h-full bg-gradient-to-r from-blue-500 to-blue-600 rounded-full transition-all duration-300 ease-out"
-                  style={{ width: `${uploadProgress}%` }}
+                  style={{ width: `${upload.progress}%` }}
                 />
               </div>
             </div>
@@ -167,6 +258,108 @@ export default function FileUploader({ onUploaded }: { onUploaded?: () => void }
             </p>
             <p className="text-sm text-gray-500 mt-2">支持 TXT / Markdown / Word (.docx/.doc) / PDF，最大 50MB</p>
           </>
+        )}
+      </div>
+
+      {/* Template selector */}
+      <div className="mt-3">
+        <button
+          type="button"
+          onClick={() => setShowTemplates(!showTemplates)}
+          className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 transition-colors"
+        >
+          <svg
+            className={`w-3 h-3 transition-transform ${showTemplates ? 'rotate-90' : ''}`}
+            fill="none"
+            stroke="currentColor"
+            viewBox="0 0 24 24"
+          >
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+          </svg>
+          选择剧本模板
+          {selectedTemplate && (
+            <span className="text-blue-500">
+              — {selectedTemplate.icon} {selectedTemplate.name}
+            </span>
+          )}
+        </button>
+        {showTemplates && (
+          <div className="mt-2 space-y-3">
+            {Array.from(TEMPLATE_CATEGORIES.entries()).map(([category, templates]) => (
+              <div key={category}>
+                <div className="text-xs font-medium text-gray-500 dark:text-gray-400 mb-1.5 ml-1">
+                  {category}
+                </div>
+                <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-2">
+                  {templates.map((tpl) => {
+                    const isSelected = selectedTemplate?.id === tpl.id;
+                    return (
+                      <button
+                        key={tpl.id}
+                        type="button"
+                        onClick={() => {
+                          setSelectedTemplate(isSelected ? null : tpl);
+                          if (!isSelected) setShowTemplates(false);
+                        }}
+                        className={`text-left p-3 rounded-xl border-2 transition-all ${
+                          isSelected
+                            ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20 shadow-md shadow-blue-500/10'
+                            : 'border-gray-200 dark:border-gray-700 hover:border-blue-300 dark:hover:border-blue-700 bg-white dark:bg-gray-900'
+                        }`}
+                      >
+                        <div className="flex items-center gap-1.5 mb-1">
+                          <span className="text-base">{tpl.icon}</span>
+                          <span className="text-xs font-semibold text-gray-800 dark:text-gray-200 truncate">
+                            {tpl.name}
+                          </span>
+                        </div>
+                        <p className="text-[10px] text-gray-500 dark:text-gray-400 leading-relaxed line-clamp-2">
+                          {tpl.description}
+                        </p>
+                        <div className="flex flex-wrap gap-1 mt-1.5">
+                          {tpl.features.slice(0, 3).map((f) => (
+                            <span
+                              key={f}
+                              className="px-1.5 py-0.5 text-[9px] rounded-full bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400"
+                            >
+                              {f}
+                            </span>
+                          ))}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            ))}
+            {selectedTemplate && (
+              <div className="bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-lg p-3">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-sm font-medium text-blue-700 dark:text-blue-300">
+                    {selectedTemplate.icon} {selectedTemplate.name}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedTemplate(null)}
+                    className="text-xs text-blue-500 hover:text-red-500 transition-colors"
+                  >
+                    移除
+                  </button>
+                </div>
+                <p className="text-xs text-blue-600 dark:text-blue-400 mb-2">
+                  {selectedTemplate.description}
+                </p>
+                <details className="text-xs">
+                  <summary className="text-gray-500 cursor-pointer hover:text-gray-700 dark:hover:text-gray-300">
+                    预览模板 Prompt
+                  </summary>
+                  <pre className="mt-1 p-2 bg-gray-950 text-gray-400 rounded text-[10px] leading-relaxed max-h-32 overflow-auto whitespace-pre-wrap">
+                    {selectedTemplate.prompt.slice(0, 500)}...
+                  </pre>
+                </details>
+              </div>
+            )}
+          </div>
         )}
       </div>
 
@@ -206,7 +399,7 @@ export default function FileUploader({ onUploaded }: { onUploaded?: () => void }
         )}
       </div>
 
-      {error && (
+      {upload.error && (
         <div className="mt-3 flex items-center gap-2 text-sm text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 px-4 py-2.5 rounded-xl">
           <svg className="w-4 h-4 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path
@@ -216,7 +409,7 @@ export default function FileUploader({ onUploaded }: { onUploaded?: () => void }
               d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
             />
           </svg>
-          {error}
+          {upload.error}
         </div>
       )}
     </div>

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class UploadResponse(BaseModel):
@@ -50,3 +50,37 @@ class EvaluationResponse(BaseModel):
     score: int | None
     summary: str
     details: dict | None = None
+
+
+class UpdateScreenplayRequest(BaseModel):
+    yaml_content: str = Field(..., min_length=1, description="Edited YAML content")
+
+
+class UpdateScreenplayResponse(BaseModel):
+    title: str
+    character_count: int
+    act_count: int
+    scene_count: int
+
+
+class ChatMessage(BaseModel):
+    role: str  # "user" | "assistant"
+    content: str
+
+
+class ChatEditRequest(BaseModel):
+    instruction: str = Field(..., min_length=1, description="Natural language editing instruction")
+    current_yaml: str = Field(..., min_length=1, description="Current screenplay YAML content")
+    conversation_history: list[ChatMessage] | None = Field(None, description="Prior conversation messages")
+
+
+class ChangeItem(BaseModel):
+    type: str  # "modify" | "add" | "delete"
+    target: str
+    description: str
+
+
+class ChatEditResponse(BaseModel):
+    modified_yaml: str
+    change_summary: str
+    changes: list[ChangeItem] = []

@@ -36,5 +36,8 @@ class ConversionTask(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=_utcnow, onupdate=_utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
+    source_file_key: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    yaml_file_key: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
     user = relationship("User", back_populates="tasks")
     screenplay = relationship("ScreenplayRecord", back_populates="task", uselist=False, cascade="all, delete-orphan")

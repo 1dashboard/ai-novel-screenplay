@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import json
-import uuid
+import logging
+import tempfile
 from pathlib import Path
+from typing import Optional
 
-from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, UploadFile, status
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import APIRouter, Body, Depends, Form, HTTPException, Query, Request, status
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from ..config import settings
@@ -17,64 +20,98 @@ from ..models.task import ConversionTask
 from ..models.screenplay import ScreenplayRecord
 from ..models.user import User
 from ..schemas.conversion import (
+    ChatEditRequest,
+    ChatEditResponse,
     EvaluationResponse,
     ScreenplayResponse,
     TaskListResponse,
     TaskResponse,
+    UpdateScreenplayRequest,
+    UpdateScreenplayResponse,
     UploadResponse,
 )
 from ..services import conversion_service as svc
+from ..services import cos_service as cos
+from ..services import chat_service as chat_svc
 from ..services.stream import register as stream_register, unregister as stream_unregister
 
 from .deps import get_current_user
 
 router = APIRouter(tags=["conversion"])
 
+logger = logging.getLogger(__name__)
+
 VALID_EXTENSIONS = {".txt", ".md", ".markdown", ".docx", ".doc", ".pdf"}
 MAX_UPLOAD_BYTES = settings.max_upload_size_mb * 1024 * 1024
 
 
-def _save_upload(user: User, file: UploadFile) -> tuple[str, str, int]:
-    """Save uploaded file to disk. Returns (original_name, disk_path, size)."""
-    ext = Path(file.filename or "unknown").suffix.lower()
+# ---------------------------------------------------------------------------
+# Presign — get a temporary upload URL for COS direct upload
+# ---------------------------------------------------------------------------
+
+class PresignRequest(BaseModel):
+    filename: str = Field(..., min_length=1, max_length=255)
+
+
+@router.post("/presign", status_code=status.HTTP_200_OK)
+def presign_upload(
+    body: PresignRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    ext = Path(body.filename).suffix.lower()
     if ext not in VALID_EXTENSIONS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"不支持的文件格式 '{ext}'。支持：{', '.join(sorted(VALID_EXTENSIONS))}",
         )
 
-    user_dir = Path(settings.upload_dir) / str(user.id)
-    user_dir.mkdir(parents=True, exist_ok=True)
+    key = cos.generate_source_key(current_user.id, body.filename)
+    upload_url = cos.generate_presigned_upload(key)
 
-    safe_name = f"{uuid.uuid4().hex[:12]}_{file.filename}"
-    disk_path = user_dir / safe_name
+    return {"upload_url": upload_url, "key": key}
 
-    content = file.file.read()
-    if len(content) > MAX_UPLOAD_BYTES:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"文件大小不能超过 {settings.max_upload_size_mb} MB",
-        )
 
-    disk_path.write_bytes(content)
-    return file.filename or "unknown", str(disk_path), len(content)
-
+# ---------------------------------------------------------------------------
+# Upload — create a conversion task from a COS key
+# ---------------------------------------------------------------------------
 
 @router.post("/upload", response_model=UploadResponse, status_code=status.HTTP_201_CREATED)
-async def upload(
-    file: UploadFile,
+async def create_task_from_cos(
+    key: str = Form(..., description="COS object key of the uploaded file"),
+    filename: str = Form(..., description="Original filename"),
+    size: int = Form(0, description="File size in bytes"),
     model: str = Form("", description="Optional LLM model override"),
     prompt: str = Form("", description="Optional custom system prompt"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    original_name, disk_path, size = _save_upload(current_user, file)
+    ext = Path(filename).suffix.lower()
+    if ext not in VALID_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"不支持的文件格式 '{ext}'。",
+        )
+
+    if size > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"文件大小不能超过 {settings.max_upload_size_mb} MB",
+        )
+
+    # Download from COS to a temp file for the parser
+    tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+    try:
+        cos.download_object_to_file(key, tmp.name)
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="无法从对象存储读取文件")
 
     task = ConversionTask(
         user_id=current_user.id,
-        original_filename=original_name,
-        file_path=disk_path,
+        original_filename=filename,
+        file_path=tmp.name,
         file_size=size,
+        source_file_key=key,
         custom_prompt=prompt or None,
     )
     db.add(task)
@@ -238,6 +275,101 @@ def get_screenplay(
     )
 
 
+@router.put("/tasks/{task_id}/screenplay", response_model=UpdateScreenplayResponse)
+def update_screenplay(
+    task_id: int,
+    body: UpdateScreenplayRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Save edited screenplay YAML and re-parse to update statistics."""
+    task = db.query(ConversionTask).filter(
+        ConversionTask.id == task_id,
+        ConversionTask.user_id == current_user.id,
+    ).first()
+    if not task or task.status != "completed":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Screenplay not available")
+
+    if not task.screenplay:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Screenplay data not found")
+
+    # Validate YAML by parsing it
+    from src.schema import ScreenplayYAML
+    try:
+        sp = ScreenplayYAML.parse_yaml(body.yaml_content)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"YAML 格式无效: {str(e)}",
+        )
+
+    # Update stats from parsed YAML
+    record = task.screenplay
+    record.yaml_content = body.yaml_content
+    record.title = sp.meta.title
+    record.character_count = len(sp.characters)
+    record.act_count = sp.meta.total_acts
+    record.scene_count = sp.meta.total_scenes
+    db.commit()
+
+    # Re-upload to COS
+    if task.yaml_file_key:
+        try:
+            cos.upload_object(task.yaml_file_key, body.yaml_content.encode("utf-8"), "application/x-yaml")
+        except Exception as e:
+            logger.warning("Failed to update YAML in COS: %s", e)
+
+    return UpdateScreenplayResponse(
+        title=record.title,
+        character_count=record.character_count,
+        act_count=record.act_count,
+        scene_count=record.scene_count,
+    )
+
+
+@router.post("/tasks/{task_id}/chat", response_model=ChatEditResponse)
+async def chat_edit(
+    task_id: int,
+    body: ChatEditRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """AI chat assistant — natural language screenplay editing.
+
+    Sends the user's instruction + current YAML to the LLM, which returns
+    a modified YAML and a summary of changes. The modified YAML is NOT
+    saved automatically — the client must confirm by calling PUT /screenplay.
+    """
+    task = db.query(ConversionTask).filter(
+        ConversionTask.id == task_id,
+        ConversionTask.user_id == current_user.id,
+    ).first()
+    if not task or task.status != "completed":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found or not completed")
+
+    history = None
+    if body.conversation_history:
+        history = [{"role": m.role, "content": m.content} for m in body.conversation_history]
+
+    try:
+        result = await chat_svc.chat_edit(
+            current_yaml=body.current_yaml,
+            instruction=body.instruction,
+            conversation_history=history,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
+    except Exception as e:
+        logger.exception("Chat edit failed for task %d", task_id)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"AI 编辑失败: {str(e)}")
+
+    return ChatEditResponse(
+        modified_yaml=result["modified_yaml"],
+        change_summary=result["change_summary"],
+        changes=result.get("changes", []),
+    )
+
+
 @router.get("/tasks/{task_id}/yaml")
 def download_yaml(
     task_id: int,
@@ -248,19 +380,24 @@ def download_yaml(
         ConversionTask.id == task_id,
         ConversionTask.user_id == current_user.id,
     ).first()
-    if not task or not task.screenplay_yaml_path:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="YAML not available")
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
 
-    file_path = Path(task.screenplay_yaml_path)
-    if not file_path.exists():
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="YAML file not found on disk")
+    # Prefer COS redirect
+    if task.yaml_file_key:
+        return RedirectResponse(url=cos.generate_presigned_download(task.yaml_file_key))
 
-    safe_name = Path(task.original_filename).stem + "_screenplay.yaml"
-    return FileResponse(
-        path=str(file_path),
-        filename=safe_name,
-        media_type="application/x-yaml",
-    )
+    # Fallback: serve from DB
+    if task.screenplay and task.screenplay.yaml_content:
+        from fastapi.responses import Response
+        safe_name = Path(task.original_filename).stem + "_screenplay.yaml"
+        return Response(
+            content=task.screenplay.yaml_content.encode("utf-8"),
+            media_type="application/x-yaml",
+            headers={"Content-Disposition": f'attachment; filename="{safe_name}"'},
+        )
+
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="YAML not available")
 
 
 @router.get("/tasks/{task_id}/evaluation", response_model=EvaluationResponse)
@@ -295,8 +432,14 @@ def delete_task(
     if not task:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
 
-    # Delete files
-    for p in [task.file_path, task.screenplay_yaml_path, task.eval_report_path]:
+    # Delete COS objects
+    if task.source_file_key:
+        cos.delete_object(task.source_file_key)
+    if task.yaml_file_key:
+        cos.delete_object(task.yaml_file_key)
+
+    # Delete local temp files (if any remain)
+    for p in [task.file_path]:
         if p:
             try:
                 Path(p).unlink(missing_ok=True)

@@ -111,7 +111,7 @@ export function exportHtml(data: ScreenplayData, title: string): void {
   .transition { text-align: right; font-weight: 600; text-transform: uppercase; font-size: 13px; color: #6b7280; margin: 20px 0; padding-top: 12px; border-top: 1px solid #e5e7eb; }
   .note { border-left: 3px solid #3b82f6; padding: 8px 12px; margin: 12px 0; font-size: 13px; background: #eff6ff; }
   .note.warning { border-color: #f59e0b; background: #fffbeb; }
-  @media print { body { margin: 0; } .scene { break-inside: avoid; } }
+  @media print { body { margin: 0; } .scene { break-inside: avoid; } h2 { break-after: avoid; } .act-section { break-inside: avoid; } }
 </style>
 </head>
 <body>
@@ -141,6 +141,7 @@ export function exportHtml(data: ScreenplayData, title: string): void {
 ${data.acts
   .map(
     (act) => `
+	<div class="act-section">
 <h2>${escHtml(act.title || `第${act.act_number}幕`)}</h2>
 ${act.scenes
   .map(
@@ -174,6 +175,7 @@ ${act.scenes
 </div>`
   )
   .join('\n')}
+	</div>
 `
   )
   .join('\n')}

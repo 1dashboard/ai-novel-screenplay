@@ -15,6 +15,13 @@ class Settings(BaseSettings):
     max_upload_size_mb: int = 50
     config_path: str = "./config.yaml"
 
+    # Tencent COS object storage
+    cos_host: str = ""
+    cos_secret_id: str = ""
+    cos_secret_key: str = ""
+    cos_region: str = ""
+    cos_bucket: str = ""
+
     model_config = {"env_prefix": "N2S_", "env_file": ".env", "extra": "ignore"}
 
 

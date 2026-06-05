@@ -216,6 +216,10 @@ class NovelToScriptConverter:
                 for elem in es.content:
                     content.append(self._convert_element(elem, name_to_id, characters))
 
+                if not content:
+                    scene_counter -= 1
+                    continue
+
                 all_scenes.append(Scene(
                     scene_number=scene_counter,
                     scene_heading=es.scene_heading or f"未命名场景 - 第{analysis.chapter_number}章",

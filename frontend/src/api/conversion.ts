@@ -55,3 +55,46 @@ export async function downloadYaml(taskId: number, filename: string): Promise<vo
   link.remove();
   window.URL.revokeObjectURL(url);
 }
+
+export interface UpdateScreenplayResult {
+  title: string;
+  character_count: number;
+  act_count: number;
+  scene_count: number;
+}
+
+export async function updateScreenplay(taskId: number, yaml_content: string): Promise<UpdateScreenplayResult> {
+  const { data } = await client.put(`/conversion/tasks/${taskId}/screenplay`, { yaml_content });
+  return data;
+}
+
+export interface ChatMessage {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+export interface ChangeItem {
+  type: 'modify' | 'add' | 'delete';
+  target: string;
+  description: string;
+}
+
+export interface ChatEditResponse {
+  modified_yaml: string;
+  change_summary: string;
+  changes: ChangeItem[];
+}
+
+export async function chatEdit(
+  taskId: number,
+  instruction: string,
+  currentYaml: string,
+  conversationHistory?: ChatMessage[],
+): Promise<ChatEditResponse> {
+  const { data } = await client.post(`/conversion/tasks/${taskId}/chat`, {
+    instruction,
+    current_yaml: currentYaml,
+    conversation_history: conversationHistory || [],
+  });
+  return data;
+}
