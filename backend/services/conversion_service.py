@@ -153,8 +153,8 @@ def _sync_run_conversion(task_id: int, file_path: str, output_path: str, config_
             db.commit()
 
         # --- Run conversion ---
-        from ..config import settings as app_settings
         max_workers = _load_max_parallel_chapters(config_path)
+        logger.info("Starting conversion with max_workers=%d", max_workers)
         screenplay = converter.convert(
             file_path, output_path,
             use_llm=(converter.llm is not None),

@@ -91,9 +91,10 @@ class NovelToScriptConverter:
         if use_llm and self.llm is not None:
             workers = min(max_workers, len(novel.chapters))
             if workers <= 1:
+                logger.info("Sequential analysis (%d chapter(s))", len(novel.chapters))
                 all_analyses = self._analyze_sequential(novel.chapters, known_characters)
             else:
-                logger.info("Using %d parallel workers for %d chapters", workers, len(novel.chapters))
+                logger.info("Parallel analysis: %d workers for %d chapters", workers, len(novel.chapters))
                 all_analyses = self._analyze_parallel(novel.chapters, known_characters, workers)
         else:
             logger.info("LLM disabled; producing structural template.")
