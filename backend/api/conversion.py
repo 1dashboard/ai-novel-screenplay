@@ -562,6 +562,9 @@ def _export_markdown(session: ChatSession, messages: list) -> str:
         lines.append("")
 
     return "\n".join(lines)
+
+
+@router.get("/tasks/{task_id}/yaml")
 def download_yaml(
     task_id: int,
     db: Session = Depends(get_db),
