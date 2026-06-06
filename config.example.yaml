@@ -15,6 +15,8 @@ llm:
 conversion:
   # Maximum characters per chunk sent to LLM in one request
   max_chunk_size: 8000
+  # Max parallel chapter analysis workers (4 = 4 chapters analyzed simultaneously)
+  max_parallel_chapters: 4
   # Chapter detection patterns (regex)
   chapter_patterns:
     - "^第[零一二三四五六七八九十百千0-9]+章"
