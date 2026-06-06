@@ -25,8 +25,8 @@ class ScreenplayRecord(Base):
     act_count: Mapped[int] = mapped_column(Integer, nullable=False)
     scene_count: Mapped[int] = mapped_column(Integer, nullable=False)
     score: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    yaml_content: Mapped[str] = mapped_column(Text, nullable=False)
-    eval_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    yaml_content: Mapped[str] = mapped_column(Text(16777215), nullable=False)  # MEDIUMTEXT
+    eval_summary: Mapped[str | None] = mapped_column(Text(16777215), nullable=True)  # MEDIUMTEXT
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=_utcnow)
 
     task = relationship("ConversionTask", back_populates="screenplay")

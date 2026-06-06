@@ -574,11 +574,11 @@ def download_yaml(
     if not task:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
 
-    # Prefer COS redirect
-    if task.yaml_file_key:
+    # COS 优先（已配置且有 key 时），否则走 DB
+    if task.yaml_file_key and cos.get_host():
         return RedirectResponse(url=cos.generate_presigned_download(task.yaml_file_key))
 
-    # Fallback: serve from DB
+    # DB 兜底
     if task.screenplay and task.screenplay.yaml_content:
         from fastapi.responses import Response
         safe_name = Path(task.original_filename).stem + "_screenplay.yaml"
