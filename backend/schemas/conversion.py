@@ -71,7 +71,8 @@ class ChatMessage(BaseModel):
 class ChatEditRequest(BaseModel):
     instruction: str = Field(..., min_length=1, description="Natural language editing instruction")
     current_yaml: str = Field(..., min_length=1, description="Current screenplay YAML content")
-    conversation_history: list[ChatMessage] | None = Field(None, description="Prior conversation messages")
+    conversation_history: list[ChatMessage] | None = Field(None, description="Prior conversation messages (deprecated, use session_id)")
+    session_id: int | None = Field(None, description="Chat session ID for persistent memory")
 
 
 class ChangeItem(BaseModel):
@@ -84,3 +85,33 @@ class ChatEditResponse(BaseModel):
     modified_yaml: str
     change_summary: str
     changes: list[ChangeItem] = []
+    session_id: int | None = None
+
+
+# ---------------------------------------------------------------------------
+# Chat history schemas
+# ---------------------------------------------------------------------------
+
+class ChatMessageResponse(BaseModel):
+    id: int
+    role: str
+    content: str
+    change_summary: str | None = None
+    changes: list[ChangeItem] | None = None
+    accepted: bool | None = None
+    rejected: bool | None = None
+    token_count: int | None = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class ChatSessionResponse(BaseModel):
+    session_id: int
+    title: str | None = None
+    message_count: int
+    messages: list[ChatMessageResponse]
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}

@@ -41,3 +41,4 @@ class ConversionTask(Base):
 
     user = relationship("User", back_populates="tasks")
     screenplay = relationship("ScreenplayRecord", back_populates="task", uselist=False, cascade="all, delete-orphan")
+    chat_session = relationship("ChatSession", back_populates="task", uselist=False, cascade="all, delete-orphan")

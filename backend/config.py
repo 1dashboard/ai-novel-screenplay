@@ -22,6 +22,14 @@ class Settings(BaseSettings):
     cos_region: str = ""
     cos_bucket: str = ""
 
+    # Redis — chat memory cache (optional)
+    redis_enabled: bool = True
+    redis_host: str = "localhost"
+    redis_port: int = 6379
+    redis_database: int = 3
+    redis_password: str = ""
+    redis_ttl_seconds: int = 3600
+
     model_config = {"env_prefix": "N2S_", "env_file": ".env", "extra": "ignore"}
 
 
