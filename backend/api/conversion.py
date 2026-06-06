@@ -579,12 +579,15 @@ def download_yaml(
 
     # DB 优先（最快最可靠），COS 兜底
     if task.screenplay and task.screenplay.yaml_content:
+        from urllib.parse import quote
         from fastapi.responses import Response
         safe_name = Path(task.original_filename).stem + "_screenplay.yaml"
+        # RFC 5987 编码支持中文文件名
+        encoded_name = quote(safe_name, safe="")
         return Response(
             content=task.screenplay.yaml_content.encode("utf-8"),
-            media_type="application/x-yaml",
-            headers={"Content-Disposition": f'attachment; filename="{safe_name}"'},
+            media_type="application/x-yaml; charset=utf-8",
+            headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}"},
         )
 
     if task.yaml_file_key and cos.get_host():
