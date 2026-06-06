@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -19,9 +20,12 @@ from ..database import get_db
 from ..models.task import ConversionTask
 from ..models.screenplay import ScreenplayRecord
 from ..models.user import User
+from ..models.chat import ChatSession
 from ..schemas.conversion import (
     ChatEditRequest,
     ChatEditResponse,
+    ChatSessionResponse,
+    ChatMessageResponse,
     EvaluationResponse,
     ScreenplayResponse,
     TaskListResponse,
@@ -334,11 +338,10 @@ async def chat_edit(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """AI chat assistant — natural language screenplay editing.
+    """AI chat assistant — natural language screenplay editing with persistent memory.
 
-    Sends the user's instruction + current YAML to the LLM, which returns
-    a modified YAML and a summary of changes. The modified YAML is NOT
-    saved automatically — the client must confirm by calling PUT /screenplay.
+    Messages are saved to DB and recent context (last 12) is sent to the LLM.
+    The modified YAML is NOT saved automatically — use PUT /screenplay to confirm.
     """
     task = db.query(ConversionTask).filter(
         ConversionTask.id == task_id,
@@ -355,6 +358,10 @@ async def chat_edit(
         result = await chat_svc.chat_edit(
             current_yaml=body.current_yaml,
             instruction=body.instruction,
+            db=db,
+            user_id=current_user.id,
+            task_id=task_id,
+            session_id=body.session_id,
             conversation_history=history,
         )
     except ValueError as e:
@@ -367,7 +374,194 @@ async def chat_edit(
         modified_yaml=result["modified_yaml"],
         change_summary=result["change_summary"],
         changes=result.get("changes", []),
+        session_id=result.get("session_id"),
     )
+
+
+# ---------------------------------------------------------------------------
+# Chat session — history persistence
+# ---------------------------------------------------------------------------
+
+@router.get("/tasks/{task_id}/chat/session", response_model=ChatSessionResponse)
+def get_chat_session(
+    task_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Get or create the chat session for a task, with full message history."""
+    task = db.query(ConversionTask).filter(
+        ConversionTask.id == task_id,
+        ConversionTask.user_id == current_user.id,
+    ).first()
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+
+    session = chat_svc.get_or_create_session(db, current_user.id, task_id)
+    messages = chat_svc.get_all_messages(db, session.id)
+
+    # Build message responses with parsed changes
+    msg_responses: list[ChatMessageResponse] = []
+    for m in messages:
+        changes = None
+        if m.changes_json:
+            try:
+                changes = json.loads(m.changes_json)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        msg_responses.append(ChatMessageResponse(
+            id=m.id,
+            role=m.role,
+            content=m.content,
+            change_summary=m.change_summary,
+            changes=changes,
+            accepted=m.accepted,
+            rejected=m.rejected,
+            created_at=m.created_at,
+        ))
+
+    return ChatSessionResponse(
+        session_id=session.id,
+        title=session.title,
+        message_count=session.message_count or 0,
+        messages=msg_responses,
+        created_at=session.created_at,
+        updated_at=session.updated_at,
+    )
+
+
+@router.delete("/tasks/{task_id}/chat/session", status_code=status.HTTP_204_NO_CONTENT)
+def delete_chat_session(
+    task_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Delete the chat session and all messages for a task."""
+    session = db.query(ChatSession).filter(
+        ChatSession.user_id == current_user.id,
+        ChatSession.task_id == task_id,
+    ).first()
+    if not session:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+
+    chat_svc.delete_session(db, session.id)
+
+
+@router.get("/tasks/{task_id}/chat/session/export")
+def export_chat_session(
+    task_id: int,
+    format: str = Query("json", regex="^(json|markdown)$"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """导出对话历史为 JSON 或 Markdown 文件。"""
+    from fastapi.responses import Response
+
+    session = db.query(ChatSession).filter(
+        ChatSession.user_id == current_user.id,
+        ChatSession.task_id == task_id,
+    ).first()
+    if not session:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+
+    messages = chat_svc.get_all_messages(db, session.id)
+
+    # 获取任务名称用于文件名
+    task = db.query(ConversionTask).filter(ConversionTask.id == task_id).first()
+    safe_name = Path(task.original_filename).stem if task else f"chat_task{task_id}"
+
+    if format == "markdown":
+        content = _export_markdown(session, messages)
+        filename = f"{safe_name}_chat.md"
+        media_type = "text/markdown; charset=utf-8"
+    else:
+        content = _export_json(session, messages)
+        filename = f"{safe_name}_chat.json"
+        media_type = "application/json; charset=utf-8"
+
+    return Response(
+        content=content.encode("utf-8"),
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+def _export_json(session: ChatSession, messages: list) -> str:
+    """导出为 JSON 格式。"""
+    items = []
+    for m in messages:
+        item = {
+            "id": m.id,
+            "role": m.role,
+            "content": m.content,
+            "created_at": m.created_at.isoformat() if m.created_at else None,
+        }
+        if m.role == "assistant":
+            item["change_summary"] = m.change_summary
+            if m.changes_json:
+                try:
+                    item["changes"] = json.loads(m.changes_json)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            item["accepted"] = m.accepted
+            item["rejected"] = m.rejected
+        items.append(item)
+
+    result = {
+        "session_id": session.id,
+        "title": session.title,
+        "task_id": session.task_id,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "messages": items,
+    }
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+def _export_markdown(session: ChatSession, messages: list) -> str:
+    """导出为 Markdown 对话记录。"""
+    lines = [
+        f"# 对话记录 — {session.title or '未命名'}",
+        "",
+        f"- Session ID: {session.id}",
+        f"- 消息总数: {len(messages)}",
+        f"- 导出时间: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
+        "",
+        "---",
+        "",
+    ]
+
+    for m in messages:
+        role_label = {"user": "**用户**", "assistant": "**AI 编剧助理**", "system": "**系统**"}.get(m.role, m.role)
+        time_str = m.created_at.strftime("%Y-%m-%d %H:%M:%S") if m.created_at else ""
+        lines.append(f"### {role_label} ({time_str})")
+        lines.append("")
+        lines.append(m.content)
+        lines.append("")
+
+        if m.role == "assistant":
+            if m.change_summary:
+                lines.append(f"> 修改摘要: {m.change_summary}")
+                lines.append("")
+            if m.changes_json:
+                try:
+                    changes = json.loads(m.changes_json)
+                    for ch in changes:
+                        ch_type = {"modify": "修改", "add": "新增", "delete": "删除"}.get(ch.get("type", ""), ch.get("type", ""))
+                        lines.append(f"- [{ch_type}] {ch.get('target', '')}: {ch.get('description', '')}")
+                    lines.append("")
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            if m.accepted:
+                lines.append("> 状态: 已接受")
+                lines.append("")
+            elif m.rejected:
+                lines.append("> 状态: 已拒绝")
+                lines.append("")
+
+        lines.append("---")
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 @router.get("/tasks/{task_id}/yaml")
@@ -383,19 +577,21 @@ def download_yaml(
     if not task:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
 
-    # Prefer COS redirect
-    if task.yaml_file_key:
-        return RedirectResponse(url=cos.generate_presigned_download(task.yaml_file_key))
-
-    # Fallback: serve from DB
+    # DB 优先（最快最可靠），COS 兜底
     if task.screenplay and task.screenplay.yaml_content:
+        from urllib.parse import quote
         from fastapi.responses import Response
         safe_name = Path(task.original_filename).stem + "_screenplay.yaml"
+        # RFC 5987 编码支持中文文件名
+        encoded_name = quote(safe_name, safe="")
         return Response(
             content=task.screenplay.yaml_content.encode("utf-8"),
-            media_type="application/x-yaml",
-            headers={"Content-Disposition": f'attachment; filename="{safe_name}"'},
+            media_type="application/x-yaml; charset=utf-8",
+            headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}"},
         )
+
+    if task.yaml_file_key and cos.get_host():
+        return RedirectResponse(url=cos.generate_presigned_download(task.yaml_file_key))
 
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="YAML not available")
 

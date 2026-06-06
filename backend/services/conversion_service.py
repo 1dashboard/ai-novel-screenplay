@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,6 +27,17 @@ class TaskDeletedError(Exception):
     """Raised when a task is deleted during conversion — stops processing."""
 
 
+def _load_max_parallel_chapters(config_path: str) -> int:
+    """Read max_parallel_chapters from config.yaml, default to 4."""
+    try:
+        import yaml
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        return int(cfg.get("conversion", {}).get("max_parallel_chapters", 4))
+    except Exception:
+        return 4
+
+
 def _cleanup_temp_file(file_path: str) -> None:
     """Safely remove a temporary file, ignoring errors."""
     try:
@@ -43,12 +55,13 @@ class ProgressTrackedLLMClient:
     """Wraps the existing LLMClient to report progress after each chapter analysis.
 
     Uses composition instead of inheritance to avoid issues with the existing
-    LLMClient's provider selection logic.
+    LLMClient's provider selection logic.  Thread-safe for parallel analysis.
     """
 
     def __init__(self, chapter_count: int, progress_callback: Callable[[int, str], None]):
         self._total = chapter_count
         self._done = 0
+        self._lock = threading.Lock()
         self._callback = progress_callback
 
     def wrap(self, original_client) -> ProgressTrackedLLMClient:
@@ -67,12 +80,14 @@ class ProgressTrackedLLMClient:
     def analyze_chapter(self, chapter_number: int, chapter_title: str, chapter_text: str, known_characters=None):
         self._callback(
             10 + int(80 * self._done / max(self._total, 1)),
-            f"正在分析第 {self._done + 1}/{self._total} 章：{chapter_title}",
+            f"正在分析第 {chapter_number}/{self._total} 章：{chapter_title}",
         )
         result = self._original.analyze_chapter(chapter_number, chapter_title, chapter_text, known_characters)
-        self._done += 1
-        percent = 10 + int(80 * self._done / max(self._total, 1))
-        self._callback(percent, f"第 {self._done}/{self._total} 章分析完成")
+        with self._lock:
+            self._done += 1
+            done = self._done
+        percent = 10 + int(80 * done / max(self._total, 1))
+        self._callback(percent, f"第 {done}/{self._total} 章分析完成")
         return result
 
 
@@ -138,7 +153,13 @@ def _sync_run_conversion(task_id: int, file_path: str, output_path: str, config_
             db.commit()
 
         # --- Run conversion ---
-        screenplay = converter.convert(file_path, output_path, use_llm=(converter.llm is not None))
+        max_workers = _load_max_parallel_chapters(config_path)
+        logger.info("Starting conversion with max_workers=%d", max_workers)
+        screenplay = converter.convert(
+            file_path, output_path,
+            use_llm=(converter.llm is not None),
+            max_workers=max_workers,
+        )
         progress_callback(92, "正在组装剧本结构...")
         stream_push(task_id, "log", text="[组装阶段] 正在合并角色、分配场景编号、划分幕结构...\n")
         progress_callback(96, "正在评估剧本质量...")

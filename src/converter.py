@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -57,6 +58,7 @@ class NovelToScriptConverter:
         output_path: str,
         *,
         use_llm: bool = True,
+        max_workers: int = 4,
     ) -> Screenplay:
         """Convert a novel file to a screenplay YAML.
 
@@ -65,6 +67,7 @@ class NovelToScriptConverter:
             output_path: Path to write the YAML output.
             use_llm: If True (default), use Claude to analyze chapters.
                      If False, produces a structural template only.
+            max_workers: Max parallel LLM calls for chapter analysis (default 4).
 
         Returns:
             The validated Screenplay model.
@@ -86,18 +89,13 @@ class NovelToScriptConverter:
         all_analyses: list[ChapterAnalysis] = []
 
         if use_llm and self.llm is not None:
-            for chapter in novel.chapters:
-                analysis = self._analyze_chapter(chapter, known_characters)
-                all_analyses.append(analysis)
-                # Update known_characters with newly discovered ones
-                for ec in analysis.characters:
-                    if not match_character_name(ec.name, known_characters):
-                        known_characters.append({
-                            "name": ec.name,
-                            "aliases": ec.aliases,
-                            "role": ec.role,
-                            "description": ec.description,
-                        })
+            workers = min(max_workers, len(novel.chapters))
+            if workers <= 1:
+                logger.info("Sequential analysis (%d chapter(s))", len(novel.chapters))
+                all_analyses = self._analyze_sequential(novel.chapters, known_characters)
+            else:
+                logger.info("Parallel analysis: %d workers for %d chapters", workers, len(novel.chapters))
+                all_analyses = self._analyze_parallel(novel.chapters, known_characters, workers)
         else:
             logger.info("LLM disabled; producing structural template.")
             all_analyses = self._template_analyses(novel)
@@ -123,6 +121,88 @@ class NovelToScriptConverter:
     # ------------------------------------------------------------------
     # Analysis
     # ------------------------------------------------------------------
+
+    def _analyze_sequential(
+        self,
+        chapters: list[Chapter],
+        known_characters: list[dict],
+    ) -> list[ChapterAnalysis]:
+        """Analyze chapters one by one, updating known_characters incrementally."""
+        results: list[ChapterAnalysis] = []
+        for chapter in chapters:
+            analysis = self._analyze_chapter(chapter, known_characters)
+            results.append(analysis)
+            for ec in analysis.characters:
+                if not match_character_name(ec.name, known_characters):
+                    known_characters.append({
+                        "name": ec.name,
+                        "aliases": ec.aliases,
+                        "role": ec.role,
+                        "description": ec.description,
+                    })
+        return results
+
+    def _analyze_parallel(
+        self,
+        chapters: list[Chapter],
+        known_characters: list[dict],
+        max_workers: int,
+    ) -> list[ChapterAnalysis]:
+        """Analyze chapters in parallel batches, syncing character context between batches.
+
+        Strategy: first chapter runs alone to seed known_characters, then remaining
+        chapters run in parallel batches.  This balances speed with character
+        consistency — the LLM reuses character names when it knows about them.
+        """
+        results: dict[int, ChapterAnalysis] = {}
+
+        # -- Batch 1: first chapter alone (builds initial character context) --
+        first = chapters[0]
+        analysis = self._analyze_chapter(first, known_characters)
+        results[0] = analysis
+        self._update_known_characters(known_characters, analysis)
+
+        if len(chapters) == 1:
+            return [results[0]]
+
+        # -- Batches 2+: remaining chapters in parallel groups --
+        remaining = chapters[1:]
+        batch_size = max_workers  # full parallelism after first chapter
+        for batch_start in range(0, len(remaining), batch_size):
+            batch = remaining[batch_start:batch_start + batch_size]
+            batch_idx = batch_start + 1  # offset in original chapters
+
+            with ThreadPoolExecutor(max_workers=len(batch)) as executor:
+                futures = {}
+                for i, chapter in enumerate(batch):
+                    # Snapshot current known_characters for each thread
+                    snapshot = list(known_characters)
+                    future = executor.submit(self._analyze_chapter, chapter, snapshot)
+                    futures[future] = batch_idx + i
+
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    try:
+                        batch_analysis = future.result()
+                        results[idx] = batch_analysis
+                        self._update_known_characters(known_characters, batch_analysis)
+                    except Exception as e:
+                        logger.error("Chapter %d analysis failed: %s", idx + 1, e)
+                        raise
+
+        return [results[i] for i in range(len(chapters))]
+
+    @staticmethod
+    def _update_known_characters(known_characters: list[dict], analysis: ChapterAnalysis) -> None:
+        """Merge newly discovered characters from one analysis into the known list."""
+        for ec in analysis.characters:
+            if not match_character_name(ec.name, known_characters):
+                known_characters.append({
+                    "name": ec.name,
+                    "aliases": ec.aliases,
+                    "role": ec.role,
+                    "description": ec.description,
+                })
 
     def _analyze_chapter(
         self,

@@ -15,6 +15,8 @@ llm:
 conversion:
   # Maximum characters per chunk sent to LLM in one request
   max_chunk_size: 8000
+  # Max parallel chapter analysis workers (4 = 4 chapters analyzed simultaneously)
+  max_parallel_chapters: 4
   # Chapter detection patterns (regex)
   chapter_patterns:
     - "^第[零一二三四五六七八九十百千0-9]+章"
@@ -29,6 +31,15 @@ output:
   default_yaml_width: 120
   allow_unicode: true
   sort_keys: false
+
+# Redis — AI 对话记忆缓存（可选，不配置则纯 DB 模式）
+redis:
+  enabled: true
+  host: localhost
+  port: 6379
+  database: 3
+  password: ""
+  ttl: 3600  # 缓存过期时间（秒）
 
 cos:
   client:
